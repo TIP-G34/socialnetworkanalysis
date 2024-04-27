@@ -1,7 +1,9 @@
 from storage import Storage
-from pycozo.client import Client
+from kuzu import Connection
+import kuzu
 
 class SocialNetworkAnalysis:
+    storage: Storage
 
-    def __init__(self, cozo_client: Client):
-        self.storage = Storage(cozo_client)
+    def __init__(self, kuzu_client: Connection):
+        self.storage = Storage(kuzu_client)

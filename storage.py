@@ -1,18 +1,24 @@
 import pandas as pd
-import kuzu
+from kuzu import Connection
+import openpyxl
+import uuid
+import os
+import time
 
 class Storage:
 
-    def __init__(self):
+    def __init__(self, k_client: Connection):
         # Initialize database and create schema.
-        db = kuzu.Database("./demo_db")
-        self.k_cient = kuzu.Connection(db)
+        self.k_client = k_client
         
 
-    def clean_ingested_data(self, path):
+    def clean_data(self, df):
         # reads the data provided in pandas dataframe and cleans missing values.
-        df = pd.read_csv(path)
-        df = df.replace('N/A', 0, inplace=True)         # Replace missing values with '0'
+        df.replace('N/A', None, inplace=True)         # Replace missing values with '0'
+        df.replace('NA', None, inplace=True)
+        non_none_columns = [col for col in df.columns if col is not None]
+        # Create a new DataFrame containing only columns with non-None names
+        df = df[non_none_columns]
         return df
     
     def load_ids(self, path1, path2):
@@ -27,50 +33,182 @@ class Storage:
         df1.to_csv("../Datasets/participants", index=False)     # Save cleaned csv file to Datasets folder
         df2.to_csv("../Datasets/affiliations", index=False)
 
-    def load_data(self, path_friend, path_influential, path_feedback, path_moretime, path_advice, path_disrespect, path_schoolactivity):
-        friends = self.clean_ingested_data(path_friend)
-        influential = self.clean_ingested_data(path_influential)
-        feedback = self.clean_ingested_data(path_feedback)
-        moretime = self.clean_ingested_data(path_moretime)
-        advice = self.clean_ingested_data(path_advice)
-        disrespect = self.clean_ingested_data(path_disrespect)
-        schoolactivity = self.clean_ingested_data(path_schoolactivity)
-
-        friends.to_csv("../Datasets/friends", index=False)      # Save cleaned csv file to Datasets folder
-        influential.to_csv("../Datasets/influential", index=False)
-        feedback.to_csv("../Datasets/feedback", index=False)
-        moretime.to_csv("../Datasets/moretime", index=False)
-        advice.to_csv("../Datasets/advice", index=False)
-        disrespect.to_csv("../Datasets/disrespect", index=False)
-        schoolactivity.to_csv("../Datasets/schoolactivity", index=False)
-
-    def create_database(self, path1, path2):
-
-        self.load_ids(path1, path2)          # Save cleaned csv files of participants and affiliations
-
-        self.k_client.execute("CREATE NODE TABLE participants(part_ID INT64, title STRING, PRIMARY KEY (part_ID))")
-        self.k_client.execute("CREATE NODE TABLE affiliations(aff_ID INT64, PRIMARY KEY (aff_ID))")
-
-        # Friends
-        self.k_client.execute("CREATE REL TABLE friends(FROM participants TO participants)")
+    def load_data(self,file_type,data_type,file_path,helper):
+        status = False
+        message = ""
+        if file_type == 'csv':
+            return self.process_csv(data_type,file_path)
+        elif file_type == 'excel':
+            return self.process_excel(file_path,helper)
+        else:
+            status = False
+            message = "Invalid file type"
         
-        # influential
-        self.k_client.execute("CREATE REL TABLE influential(FROM participants TO participants)")
+        return {
+                'status': status,
+                'message': message
+                    }
 
-        # Feedback
-        self.k_client.execute("CREATE REL TABLE feedback(FROM participants TO participants)")
 
-        # MoreTime
-        self.k_client.execute("CREATE REL TABLE moretime(FROM participants TO participants)")
+    def process_excel(self, file_path,helper):
+        try:
+            workbook = openpyxl.load_workbook(file_path,data_only=True)
+        except Exception as e:
+            return {
+                'status': False,
+                'message': str(e)
+            }
 
-        # Advice
-        self.k_client.execute("CREATE REL TABLE advice(FROM participants TO participants)")
+        all_data = {}
 
-        # Disrespect
-        self.k_client.execute("CREATE REL TABLE disrespect(FROM participants TO participants)")
+        try:
+            for sheet_name in workbook.sheetnames:
+                sheet = workbook[sheet_name]            
+                sheet_data = []
 
-        # SchoolActivity
-        self.k_client.execute("CREATE REL TABLE schoolactivity(FROM participants TO affiliations)")
+                is_header_row = True
+                for row in sheet.iter_rows(values_only=True):
+                    if is_header_row:
+                        header_row = row
+                        is_header_row = False
+                        continue
+
+                    sheet_data.append(dict(zip(header_row, row)))
+                all_data[sheet_name] = sheet_data
+        except Exception as e:
+            return {
+                'status': False,
+                'message': str(e)
+            }
+        
+        try:
+            for key, value in all_data.items():
+                if "net_" not in key and "data_dictionary" not in key:
+                    cleaned_data = self.clean_data(pd.DataFrame(value))     
+                    create_table_response = self.create_tables(helper[key])  
+                    if create_table_response['status'] == False:
+                        return create_table_response
+                    
+                    if not os.path.exists("../tmp"):
+                        os.makedirs("../tmp")
+                    
+                    tmp_file_path = f"""../tmp/{str(uuid.uuid4()).replace("-","")}.csv"""
+                    cleaned_data.to_csv(tmp_file_path, index=False,header=False)
+                    self.ingest_data(helper[key],tmp_file_path)
+                    # os.remove(tmp_file_path)
+
+                    continue
+        except Exception as e:
+            return {
+                'status': False,
+                'message': str(e)
+            }
+        
+        try:
+            for key, value in all_data.items():
+                if "net_" in key:
+                    cleaned_data = self.clean_data(pd.DataFrame(value))     
+                    create_rel_response = self.create_relationships(helper[key])  
+                    if create_rel_response['status'] == False:
+                        return create_rel_response
+                    
+                    if not os.path.exists("../tmp"):
+                        os.makedirs("../tmp")
+                    
+                    tmp_file_path = f"""../tmp/{str(uuid.uuid4()).replace("-","")}.csv"""
+                    cleaned_data.to_csv(tmp_file_path, index=False,header=False)
+                    self.ingest_relationships(helper[key],tmp_file_path)
+                    # os.remove(tmp_file_path)
+
+                    continue
+        except Exception as e:
+            return {
+                'status': False,
+                'message': str(e)
+            }
+
+
+    # 
+
+    def create_tables(self, helper):
+        columns = ""
+        print(helper)
+        for key, value in helper["columns"].items():
+            columns += f"{key} {value},"
+
+        columns += f"""PRIMARY KEY ({helper["primary_key"]})"""
+        try:
+            self.k_client.execute(f"""CREATE NODE TABLE {helper["table_name"]}(
+                {columns}
+            )""")
+        except Exception as e:
+            if "already exists" in str(e):
+                return {
+                    'status': True,
+                    'message': "Table already exists"
+                }
+        
+        return {
+            'status': True,
+            'message': "Table created successfully"
+        }
+    
+    def create_relationships(self, helper):
+        # CREATE REL TABLE LivesIn(FROM User TO City)
+        try:
+            self.k_client.execute(f"""CREATE REL TABLE {helper["relationship_name"]}(
+                FROM {helper["source"]} TO {helper["target"]}
+            )""")
+        except Exception as e:
+            if "already exists" in str(e):
+                return {
+                    'status': True,
+                    'message': "Relationship already exists"
+                }
+        
+        return {
+            'status': True,
+            'message': "Relationship created successfully"
+        }
+    
+    def ingest_relationships(self,helper,tmp_csv_path):
+        try:
+            self.k_client.execute(f"""COPY {helper["relationship_name"]} FROM "{tmp_csv_path}" """)
+            return {
+                'status': True,
+                'message': "Relationsip ingested successfully"
+            }
+        except Exception as e:
+            print(str(e))
+            if "COPY commands can only" in str(e):
+                return {
+                    'status': True,
+                    'message': "Relationship already exists"
+                }
+    
+
+        # print(self.k_client.execute("""
+        #     CALL db.schema()
+        #     YIELD labels
+        #     WHERE 'YourLabelName' IN labels
+        #     RETURN 'YourLabelName' AS labelExists
+        #     """))
+
+    def ingest_data(self,helper,tmp_csv_path):
+        try:
+            self.k_client.execute(f"""COPY {helper["table_name"]} FROM "{tmp_csv_path}" """)
+            return {
+                'status': True,
+                'message': "Data ingested successfully"
+            }
+        except Exception as e:
+            print(str(e))
+            if "COPY commands can only" in str(e):
+                return {
+                    'status': True,
+                    'message': "Data already exists"
+                }
+        
 
     
     def upload_data(self):
